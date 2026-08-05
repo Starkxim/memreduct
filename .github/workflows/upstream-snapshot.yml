@@ -80,7 +80,7 @@ jobs:
         with:
           repository: ${{ env.UPSTREAM_REPOSITORY }}
           ref: ${{ needs.sync.outputs.source_sha }}
-          path: source
+          path: memreduct
 
       - name: Check out routine dependency
         uses: actions/checkout@v4
@@ -94,12 +94,65 @@ jobs:
           repository: henrypp/builder
           path: builder
 
+      - name: Regenerate language pack from translation sources
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # The upstream locale builder reads UTF-16, but translation updates
+          # are occasionally committed as UTF-8. Normalize only files without
+          # a UTF-16 byte-order mark before invoking the official builder.
+          $utf8Strict = [Text.UTF8Encoding]::new($false, $true)
+          $utf16LittleEndian = [Text.UnicodeEncoding]::new($false, $true)
+          $translationFiles = Get-ChildItem -Path 'memreduct\bin\i18n\*.ini' -File
+
+          foreach ($translationFile in $translationFiles) {
+            $bytes = [IO.File]::ReadAllBytes($translationFile.FullName)
+            $hasUtf16Bom = $bytes.Length -ge 2 -and (
+              ($bytes[0] -eq 0xff -and $bytes[1] -eq 0xfe) -or
+              ($bytes[0] -eq 0xfe -and $bytes[1] -eq 0xff)
+            )
+
+            if ($hasUtf16Bom) {
+              continue
+            }
+
+            $translationText = $utf8Strict.GetString($bytes)
+            if ($translationText.Length -gt 0 -and $translationText[0] -eq [char]0xfeff) {
+              $translationText = $translationText.Substring(1)
+            }
+
+            [IO.File]::WriteAllText(
+              $translationFile.FullName,
+              $translationText,
+              $utf16LittleEndian
+            )
+            "Normalized UTF-8 translation: $($translationFile.Name)"
+          }
+
+          python builder\src\build_locale.py --name-short=memreduct
+          if ($LASTEXITCODE -ne 0) {
+            throw "Language pack generation failed with exit code $LASTEXITCODE"
+          }
+
+          $languagePath = Join-Path $env:GITHUB_WORKSPACE 'memreduct\bin\memreduct.lng'
+          if (-not (Test-Path $languagePath)) {
+            throw 'The generated language pack was not produced.'
+          }
+
+          $languageContent = Get-Content -Path $languagePath -Raw
+          if (-not $languageContent.Contains('[Chinese (Simplified)]')) {
+            throw 'The generated language pack does not contain Chinese (Simplified).'
+          }
+
+          'Verified generated language: Chinese (Simplified)'
+
       - name: Apply public routine compatibility shim
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
 
-          $mainPath = Join-Path $env:GITHUB_WORKSPACE 'source\src\main.c'
+          $mainPath = Join-Path $env:GITHUB_WORKSPACE 'memreduct\src\main.c'
           $routineHeader = Join-Path $env:GITHUB_WORKSPACE 'routine\src\routine.h'
           $content = Get-Content -Path $mainPath -Raw
 
@@ -321,14 +374,14 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
 
-          $buildScript = Get-Content -Path 'source\build.bat' -Raw
+          $buildScript = Get-Content -Path 'memreduct\build.bat' -Raw
           $versionMatch = [regex]::Match(
             $buildScript,
             '(?im)^\s*call\s+build\s+memreduct\s+([0-9]+\.[0-9]+\.[0-9]+)'
           )
 
           if (-not $versionMatch.Success) {
-            $versionFile = Get-Content -Path 'source\VERSION' -Raw
+            $versionFile = Get-Content -Path 'memreduct\VERSION' -Raw
             $versionMatch = [regex]::Match(
               $versionFile,
               'memreduct=([0-9]+\.[0-9]+\.[0-9]+)'
@@ -372,7 +425,7 @@ jobs:
             throw "MSBuild was not found at $msbuild"
           }
 
-          $solution = Join-Path $env:GITHUB_WORKSPACE 'source\memreduct.sln'
+          $solution = Join-Path $env:GITHUB_WORKSPACE 'memreduct\memreduct.sln'
           $buildRoot = Join-Path $env:GITHUB_WORKSPACE 'build-output'
           $x64Out = Join-Path $buildRoot '64'
           $arm64Out = Join-Path $buildRoot 'ARM64'
@@ -419,7 +472,7 @@ jobs:
           $stageRoot = Join-Path $workspace 'package-stage'
           $x64Stage = Join-Path $stageRoot '64'
           $arm64Stage = Join-Path $stageRoot 'ARM64'
-          $sourceBin = Join-Path $workspace 'source\bin'
+          $sourceBin = Join-Path $workspace 'memreduct\bin'
 
           New-Item -ItemType Directory -Force -Path $x64Stage, $arm64Stage | Out-Null
           Copy-Item (Join-Path $workspace 'build-output\64\memreduct.exe') $x64Stage
