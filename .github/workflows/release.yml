@@ -1,0 +1,177 @@
+name: Automated Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g., 3.5.3)'
+        required: true
+      release_name:
+        description: 'Release name/title'
+        required: false
+        default: 'Release'
+  schedule:
+    # Run every month on the 1st at 00:00 UTC
+    - cron: '0 0 1 * *'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v1.1
+
+      - name: Determine version
+        id: version
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            $version = "${{ github.event.inputs.version }}"
+          } else {
+            # For scheduled runs, auto-increment patch version
+            $content = Get-Content -Path VERSION -Raw
+            $line = ($content -split "`n" | Select-Object -First 1)
+            $current = $line -replace "memreduct=|=.*", ""
+            $parts = $current -split '\.'
+            $parts[2] = [int]$parts[2] + 1
+            $version = $parts -join '.'
+          }
+          echo "version=$version" >> $env:GITHUB_OUTPUT
+          echo "Version to build: $version"
+
+      - name: Build Release x64
+        run: msbuild memreduct.sln -property:Configuration=Release -property:Platform=x64 -verbosity:normal
+
+      - name: Build Release ARM64
+        run: msbuild memreduct.sln -property:Configuration=Release -property:Platform=ARM64 -verbosity:normal
+
+      - name: Create output directory
+        run: |
+          mkdir -p release_output
+
+      - name: Collect binaries
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          
+          # Copy x64 binaries
+          if (Test-Path "bin\x64\Release") {
+            Copy-Item -Path "bin\x64\Release\memreduct.exe" -Destination "release_output\memreduct-$version-x64.exe"
+          }
+          
+          # Copy ARM64 binaries
+          if (Test-Path "bin\ARM64\Release") {
+            Copy-Item -Path "bin\ARM64\Release\memreduct.exe" -Destination "release_output\memreduct-$version-arm64.exe"
+          }
+          
+          # List collected files
+          Get-ChildItem -Path release_output
+
+      - name: Generate checksums
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          $files = Get-ChildItem -Path release_output -Filter "*.exe"
+          
+          foreach ($file in $files) {
+            $hash = (Get-FileHash -Path $file.FullName -Algorithm SHA256).Hash
+            "$hash  $($file.Name)" | Out-File -FilePath "release_output\$($file.Name).sha256" -Encoding utf8
+          }
+          
+          Get-ChildItem -Path release_output
+
+      - name: Update VERSION file
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          $content = Get-Content -Path VERSION -Raw
+          $updated = $content -replace "memreduct=[\d.]+", "memreduct=$version"
+          Set-Content -Path VERSION -Value $updated -NoNewline
+          Get-Content -Path VERSION
+
+      - name: Create Release
+        uses: actions/create-release@v1
+        id: create_release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: v.${{ steps.version.outputs.version }}
+          release_name: ${{ github.event.inputs.release_name || format('Release v.{0}', steps.version.outputs.version) }}
+          body: |
+            ## Automated Release v.${{ steps.version.outputs.version }}
+            
+            This is an automatically generated release from the latest master branch.
+            
+            **Downloads:**
+            - `memreduct-${{ steps.version.outputs.version }}-x64.exe` - 64-bit executable
+            - `memreduct-${{ steps.version.outputs.version }}-arm64.exe` - ARM64 executable
+            
+            **Checksums:**
+            SHA256 checksums are included in the `.sha256` files for integrity verification.
+          draft: false
+          prerelease: false
+
+      - name: Upload x64 executable
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./release_output/memreduct-${{ steps.version.outputs.version }}-x64.exe
+          asset_name: memreduct-${{ steps.version.outputs.version }}-x64.exe
+          asset_content_type: application/octet-stream
+
+      - name: Upload x64 checksum
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./release_output/memreduct-${{ steps.version.outputs.version }}-x64.exe.sha256
+          asset_name: memreduct-${{ steps.version.outputs.version }}-x64.exe.sha256
+          asset_content_type: text/plain
+
+      - name: Upload ARM64 executable
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./release_output/memreduct-${{ steps.version.outputs.version }}-arm64.exe
+          asset_name: memreduct-${{ steps.version.outputs.version }}-arm64.exe
+          asset_content_type: application/octet-stream
+
+      - name: Upload ARM64 checksum
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./release_output/memreduct-${{ steps.version.outputs.version }}-arm64.exe.sha256
+          asset_name: memreduct-${{ steps.version.outputs.version }}-arm64.exe.sha256
+          asset_content_type: text/plain
+
+      - name: Commit VERSION update
+        if: github.event_name == 'schedule'
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add VERSION
+          git commit -m "chore: update version to ${{ steps.version.outputs.version }} [skip ci]"
+          git push
+
+  notify:
+    needs: build
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Build status
+        run: |
+          echo "Release build completed!"
+          echo "Status: ${{ needs.build.result }}"
