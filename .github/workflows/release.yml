@@ -2,6 +2,12 @@ name: Sync upstream and build snapshot
 
 on:
   workflow_dispatch:
+  # Temporary bootstrap trigger. It is removed after the first verified run.
+  workflow_run:
+    workflows:
+      - Automated Release
+    types:
+      - completed
   schedule:
     # Daily at 10:23 China Standard Time (02:23 UTC).
     - cron: "23 2 * * *"
