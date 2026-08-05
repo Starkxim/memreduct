@@ -94,6 +94,124 @@ jobs:
           repository: henrypp/builder
           path: builder
 
+      - name: Apply public routine compatibility shim
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $mainPath = Join-Path $env:GITHUB_WORKSPACE 'source\src\main.c'
+          $routineHeader = Join-Path $env:GITHUB_WORKSPACE 'routine\src\routine.h'
+          $content = Get-Content -Path $mainPath -Raw
+
+          # Current Mem Reduct master calls the section-aware SDK functions by
+          # their short names. The public routine repository exposes them with
+          # the _ex suffix. Keep the section argument and select those APIs.
+          $configFunctions = @(
+            'getboolean',
+            'getfont',
+            'getlong',
+            'getlong64',
+            'getulong',
+            'setboolean',
+            'setlong',
+            'setlong64',
+            'setulong'
+          )
+          foreach ($function in $configFunctions) {
+            $content = $content.Replace(
+              "_r_config_$function (",
+              "_r_config_${function}_ex ("
+            )
+          }
+
+          # Map the control helper names used by Mem Reduct master to the
+          # equivalent names currently published by routine.
+          $content = $content.Replace('_r_button_setcheck', '_r_ctrl_checkbutton')
+          $content = $content.Replace('_r_button_ischecked', '_r_ctrl_isbuttonchecked')
+          $content = $content.Replace('_r_wnd_sendcommand', '_r_ctrl_sendcommand')
+
+          # routine uses pointer-sized hash keys on 64-bit builds.
+          $content = $content.Replace(
+            'ULONG hash_code, index = 0;',
+            "ULONG_PTR hash_code;`r`n`tULONG index = 0;"
+          )
+
+          # Mem Reduct master uses a mount-manager helper which is not present
+          # in the public routine repository. Supply the same thin wrapper over
+          # routine's public device-I/O helper when it is absent.
+          $routineText = Get-Content -Path $routineHeader -Raw
+          if (-not $routineText.Contains('_r_fs_getvolumemountpoints')) {
+            $mountManagerShim = @'
+          #include <mountmgr.h>
+
+          static NTSTATUS _r_fs_getvolumemountpoints (
+            _Outptr_ PMOUNTMGR_MOUNT_POINTS *out_buffer,
+            _In_ HANDLE hdevice
+          )
+          {
+            MOUNTMGR_MOUNT_POINT query = {0};
+            PMOUNTMGR_MOUNT_POINTS buffer;
+            ULONG_PTR return_length = 0;
+            ULONG buffer_length = sizeof (MOUNTMGR_MOUNT_POINTS);
+            NTSTATUS status;
+
+            *out_buffer = NULL;
+
+            for (;;)
+            {
+              buffer = _r_mem_allocate (buffer_length);
+
+              status = _r_fs_deviceiocontrol (
+                hdevice,
+                IOCTL_MOUNTMGR_QUERY_POINTS,
+                &query,
+                sizeof (query),
+                buffer,
+                buffer_length,
+                &return_length
+              );
+
+              if (
+                status == STATUS_BUFFER_OVERFLOW ||
+                status == STATUS_BUFFER_TOO_SMALL ||
+                status == STATUS_INFO_LENGTH_MISMATCH
+              )
+              {
+                ULONG required_length = buffer->Size;
+
+                _r_mem_free (buffer);
+
+                if (required_length <= buffer_length)
+                  return status;
+
+                buffer_length = required_length;
+                continue;
+              }
+
+              if (!NT_SUCCESS (status))
+              {
+                _r_mem_free (buffer);
+                return status;
+              }
+
+              *out_buffer = buffer;
+              return status;
+            }
+          }
+          '@
+
+            $includeNeedle = '#include "resource.h"'
+            if (-not $content.Contains($includeNeedle)) {
+              throw 'Could not find the resource include insertion point.'
+            }
+            $content = $content.Replace(
+              $includeNeedle,
+              "$includeNeedle`r`n`r`n$mountManagerShim"
+            )
+          }
+
+          [IO.File]::WriteAllText($mainPath, $content, [Text.UTF8Encoding]::new($false))
+
       - name: Determine snapshot metadata
         id: metadata
         shell: pwsh
@@ -356,6 +474,8 @@ jobs:
           - Packages: NSIS installer and portable 7-Zip archive
 
           These binaries are built by GitHub Actions from the upstream source.
+          The build applies a minimal compatibility shim for API drift between
+          Mem Reduct master and the public henrypp/routine repository.
           They are not an official Henry++ release and are not code-signed or GPG-signed.
           Windows SmartScreen may therefore show an unknown-publisher warning.
           "@ | Set-Content -Path $notesPath -Encoding utf8
@@ -406,6 +526,7 @@ jobs:
           - Release tag: `${{ steps.metadata.outputs.tag }}`
           - Architectures: x64 and ARM64
           - Installer: NSIS (unsigned)
+          - Source compatibility: public routine API shim applied
           "@ >> $env:GITHUB_STEP_SUMMARY
 
   unchanged:
