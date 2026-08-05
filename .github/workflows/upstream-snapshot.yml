@@ -113,6 +113,7 @@ jobs:
             'getlong64',
             'getulong',
             'setboolean',
+            'setfont',
             'setlong',
             'setlong64',
             'setulong'
@@ -128,13 +129,75 @@ jobs:
           # equivalent names currently published by routine.
           $content = $content.Replace('_r_button_setcheck', '_r_ctrl_checkbutton')
           $content = $content.Replace('_r_button_ischecked', '_r_ctrl_isbuttonchecked')
+          $content = $content.Replace('_r_button_setshield', '_r_ctrl_setbuttonshield')
+          $content = $content.Replace('_r_button_setmargins', '_r_ctrl_setbuttonmargins')
           $content = $content.Replace('_r_wnd_sendcommand', '_r_ctrl_sendcommand')
+          $content = $content.Replace('_r_sys_settimer (', 'SetTimer (')
+          $content = $content.Replace('_r_config_invertboolean', '_app_configinvertboolean')
+          $content = $content.Replace('if (!_r_tray_popup (', 'if (!_app_traypopupcompat (')
+          $content = $content.Replace(
+            '_r_sys_setprocessprivilege (hwnd, NtCurrentProcess (), privileges, RTL_NUMBER_OF (privileges), TRUE);',
+            '_r_sys_setprocessprivilege (NtCurrentProcess (), privileges, RTL_NUMBER_OF (privileges), TRUE);'
+          )
+          $content = $content.Replace(
+            '_r_sys_createprocess (&taskmgr_sr, NULL, NULL, FALSE);',
+            '_r_sys_createprocess (taskmgr_sr.buffer, NULL, NULL, FALSE);'
+          )
 
           # routine uses pointer-sized hash keys on 64-bit builds.
           $content = $content.Replace(
             'ULONG hash_code, index = 0;',
             "ULONG_PTR hash_code;`r`n`tULONG index = 0;"
           )
+          $content = $content.Replace(
+            'integers[index] = hash_code;',
+            'integers[index] = (ULONG)hash_code;'
+          )
+
+          $compatibilityShim = @'
+          static BOOLEAN _app_configinvertboolean (
+            _In_ LPCWSTR key_name,
+            _In_ BOOLEAN default_value,
+            _In_opt_ LPCWSTR section_name
+          )
+          {
+            BOOLEAN value;
+
+            value = !_r_config_getboolean_ex (key_name, default_value, section_name);
+            _r_config_setboolean_ex (key_name, value, section_name);
+
+            return value;
+          }
+
+          static BOOLEAN _app_traypopupcompat (
+            _In_ HWND hwnd,
+            _In_ LPCGUID guid,
+            _In_opt_ ULONG flags,
+            _In_opt_ LPCWSTR title,
+            _In_opt_ LPCWSTR string
+          )
+          {
+            NOTIFYICONDATA nid;
+
+            _r_tray_initialize (&nid, hwnd, guid, 0);
+
+            nid.uFlags |= NIF_REALTIME;
+
+            if (flags)
+            {
+              nid.uFlags |= NIF_INFO;
+              nid.dwInfoFlags = flags;
+            }
+
+            if (title)
+              _r_str_copy (nid.szInfoTitle, RTL_NUMBER_OF (nid.szInfoTitle), title);
+
+            if (string)
+              _r_str_copy (nid.szInfo, RTL_NUMBER_OF (nid.szInfo), string);
+
+            return !!Shell_NotifyIconW (NIM_MODIFY, &nid);
+          }
+          '@
 
           # Mem Reduct master uses a mount-manager helper which is not present
           # in the public routine repository. Supply the same thin wrapper over
@@ -238,15 +301,17 @@ jobs:
           }
           '@
 
-            $includeNeedle = '#include "resource.h"'
-            if (-not $content.Contains($includeNeedle)) {
-              throw 'Could not find the resource include insertion point.'
-            }
-            $content = $content.Replace(
-              $includeNeedle,
-              "$includeNeedle`r`n`r`n$mountManagerShim"
-            )
+            $compatibilityShim += "`r`n`r`n$mountManagerShim"
           }
+
+          $includeNeedle = '#include "resource.h"'
+          if (-not $content.Contains($includeNeedle)) {
+            throw 'Could not find the resource include insertion point.'
+          }
+          $content = $content.Replace(
+            $includeNeedle,
+            "$includeNeedle`r`n`r`n$compatibilityShim"
+          )
 
           [IO.File]::WriteAllText($mainPath, $content, [Text.UTF8Encoding]::new($false))
 
