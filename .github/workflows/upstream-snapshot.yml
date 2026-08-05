@@ -1,0 +1,422 @@
+name: Sync upstream and build snapshot
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Daily at 10:23 China Standard Time (02:23 UTC).
+    - cron: "23 2 * * *"
+  push:
+    branches:
+      - master
+    paths:
+      - .github/workflows/upstream-snapshot.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: upstream-snapshot
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPOSITORY: henrypp/memreduct
+  UPSTREAM_BRANCH: master
+  MIRROR_BRANCH: upstream-master
+
+jobs:
+  sync:
+    name: Sync upstream branch
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.upstream.outputs.changed }}
+      short_sha: ${{ steps.upstream.outputs.short_sha }}
+      source_sha: ${{ steps.upstream.outputs.source_sha }}
+    steps:
+      - name: Check out automation repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch and mirror upstream
+        id: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git remote remove upstream 2>/dev/null || true
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          git fetch --no-tags --prune upstream "${UPSTREAM_BRANCH}"
+
+          source_sha="$(git rev-parse "refs/remotes/upstream/${UPSTREAM_BRANCH}")"
+          short_sha="$(git rev-parse --short=12 "${source_sha}")"
+          previous_sha="$(git ls-remote --heads origin "refs/heads/${MIRROR_BRANCH}" | awk '{print $1}')"
+
+          changed=false
+          if [[ "${source_sha}" != "${previous_sha}" ]]; then
+            changed=true
+            git push --force origin \
+              "refs/remotes/upstream/${UPSTREAM_BRANCH}:refs/heads/${MIRROR_BRANCH}"
+          fi
+
+          echo "changed=${changed}" >> "${GITHUB_OUTPUT}"
+          echo "short_sha=${short_sha}" >> "${GITHUB_OUTPUT}"
+          echo "source_sha=${source_sha}" >> "${GITHUB_OUTPUT}"
+
+          echo "Upstream commit: ${source_sha}"
+          echo "Previous mirror: ${previous_sha:-<none>}"
+          echo "Changed: ${changed}"
+
+  build:
+    name: Build x64, ARM64 and installer
+    needs: sync
+    if: >-
+      needs.sync.outputs.changed == 'true' ||
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'push'
+    runs-on: windows-2025-vs2026
+    steps:
+      - name: Check out upstream source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPOSITORY }}
+          ref: ${{ needs.sync.outputs.source_sha }}
+          path: source
+
+      - name: Check out routine dependency
+        uses: actions/checkout@v4
+        with:
+          repository: henrypp/routine
+          path: routine
+
+      - name: Check out upstream packaging scripts
+        uses: actions/checkout@v4
+        with:
+          repository: henrypp/builder
+          path: builder
+
+      - name: Determine snapshot metadata
+        id: metadata
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $buildScript = Get-Content -Path 'source\build.bat' -Raw
+          $versionMatch = [regex]::Match(
+            $buildScript,
+            '(?im)^\s*call\s+build\s+memreduct\s+([0-9]+\.[0-9]+\.[0-9]+)'
+          )
+
+          if (-not $versionMatch.Success) {
+            $versionFile = Get-Content -Path 'source\VERSION' -Raw
+            $versionMatch = [regex]::Match(
+              $versionFile,
+              'memreduct=([0-9]+\.[0-9]+\.[0-9]+)'
+            )
+          }
+
+          if (-not $versionMatch.Success) {
+            throw 'Unable to determine the Mem Reduct version.'
+          }
+
+          $version = $versionMatch.Groups[1].Value
+          $shortSha = '${{ needs.sync.outputs.short_sha }}'
+          $tag = "snapshot-v$version-$shortSha"
+
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+
+          "Version: $version"
+          "Release tag: $tag"
+
+      - name: Locate MSBuild and compile
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $vswhere = (Get-Command 'vswhere.exe' -ErrorAction SilentlyContinue).Source
+          if (-not $vswhere) {
+            $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          }
+
+          $vswhereArgs = @(
+            '-latest',
+            '-products', '*',
+            '-requires', 'Microsoft.Component.MSBuild',
+            '-property', 'installationPath'
+          )
+          $vsPath = & $vswhere @vswhereArgs
+          $msbuild = Join-Path $vsPath 'MSBuild\Current\Bin\MSBuild.exe'
+
+          if (-not (Test-Path $msbuild)) {
+            throw "MSBuild was not found at $msbuild"
+          }
+
+          $solution = Join-Path $env:GITHUB_WORKSPACE 'source\memreduct.sln'
+          $buildRoot = Join-Path $env:GITHUB_WORKSPACE 'build-output'
+          $x64Out = Join-Path $buildRoot '64'
+          $arm64Out = Join-Path $buildRoot 'ARM64'
+
+          New-Item -ItemType Directory -Force -Path $x64Out, $arm64Out | Out-Null
+
+          $x64BuildArgs = @(
+            $solution,
+            '/m',
+            '/p:Configuration=Release',
+            '/p:Platform=x64',
+            "/p:OutDir=$x64Out\"
+          )
+          & $msbuild @x64BuildArgs
+          if ($LASTEXITCODE -ne 0) {
+            throw "x64 build failed with exit code $LASTEXITCODE"
+          }
+
+          $arm64BuildArgs = @(
+            $solution,
+            '/m',
+            '/p:Configuration=Release',
+            '/p:Platform=ARM64',
+            "/p:OutDir=$arm64Out\"
+          )
+          & $msbuild @arm64BuildArgs
+          if ($LASTEXITCODE -ne 0) {
+            throw "ARM64 build failed with exit code $LASTEXITCODE"
+          }
+
+          if (-not (Test-Path (Join-Path $x64Out 'memreduct.exe'))) {
+            throw 'The x64 executable was not produced.'
+          }
+          if (-not (Test-Path (Join-Path $arm64Out 'memreduct.exe'))) {
+            throw 'The ARM64 executable was not produced.'
+          }
+
+      - name: Stage package files
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $workspace = $env:GITHUB_WORKSPACE
+          $stageRoot = Join-Path $workspace 'package-stage'
+          $x64Stage = Join-Path $stageRoot '64'
+          $arm64Stage = Join-Path $stageRoot 'ARM64'
+          $sourceBin = Join-Path $workspace 'source\bin'
+
+          New-Item -ItemType Directory -Force -Path $x64Stage, $arm64Stage | Out-Null
+          Copy-Item (Join-Path $workspace 'build-output\64\memreduct.exe') $x64Stage
+          Copy-Item (Join-Path $workspace 'build-output\ARM64\memreduct.exe') $arm64Stage
+
+          foreach ($directory in @($x64Stage, $arm64Stage)) {
+            Copy-Item (Join-Path $sourceBin 'History.txt') $directory
+            Copy-Item (Join-Path $sourceBin 'License.txt') $directory
+            Copy-Item (Join-Path $sourceBin 'Readme.txt') $directory
+            Copy-Item (Join-Path $sourceBin 'memreduct.lng') $directory
+            Set-Content -Path (Join-Path $directory 'portable.dat') -Value '#PORTABLE#' -NoNewline
+          }
+
+      - name: Install NSIS when missing
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          if (-not (Get-Command 'makensis.exe' -ErrorAction SilentlyContinue)) {
+            choco install nsis --yes --no-progress
+            if ($LASTEXITCODE -ne 0) {
+              throw "NSIS installation failed with exit code $LASTEXITCODE"
+            }
+          }
+
+      - name: Create installer, portable archive and checksums
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $workspace = $env:GITHUB_WORKSPACE
+          $version = '${{ steps.metadata.outputs.version }}'
+          $shortSha = '${{ needs.sync.outputs.short_sha }}'
+          $stageRoot = Join-Path $workspace 'package-stage'
+          $releaseRoot = Join-Path $workspace 'release-output'
+          $scriptRoot = Join-Path $env:RUNNER_TEMP 'memreduct-installer'
+
+          New-Item -ItemType Directory -Force -Path $releaseRoot, $scriptRoot | Out-Null
+          Copy-Item -Path (Join-Path $workspace 'builder\src\setup_script*.nsi') -Destination $scriptRoot
+
+          # The upstream script currently appends two numeric components to a
+          # three-component version. NSIS file versions accept four components.
+          $installerScript = Join-Path $scriptRoot 'setup_script.nsi'
+          $scriptContent = Get-Content -Path $installerScript -Raw
+          $scriptContent = $scriptContent.Replace(
+            'VIProductVersion "${APP_VERSION}.0.0"',
+            'VIProductVersion "${APP_VERSION}.0"'
+          )
+          [IO.File]::WriteAllText($installerScript, $scriptContent, [Text.UTF8Encoding]::new($false))
+
+          $baseName = "memreduct-$version-$shortSha"
+          $installerPath = Join-Path $releaseRoot "$baseName-setup.exe"
+          $portablePath = Join-Path $releaseRoot "$baseName-bin.7z"
+
+          $makensis = (Get-Command 'makensis.exe' -ErrorAction SilentlyContinue).Source
+          if (-not $makensis) {
+            $makensis = Join-Path ${env:ProgramFiles(x86)} 'NSIS\makensis.exe'
+          }
+          if (-not (Test-Path $makensis)) {
+            throw 'makensis.exe was not found after installing NSIS.'
+          }
+
+          Push-Location $scriptRoot
+          try {
+            $nsisArgs = @(
+              '/V2',
+              "/DAPP_FILES_DIR=$stageRoot",
+              '/DAPP_NAME=Mem Reduct',
+              '/DAPP_NAME_SHORT=memreduct',
+              "/DAPP_VERSION=$version",
+              "/XOutFile `"$installerPath`"",
+              '.\setup_script.nsi'
+            )
+            & $makensis @nsisArgs
+            if ($LASTEXITCODE -ne 0) {
+              throw "NSIS failed with exit code $LASTEXITCODE"
+            }
+          }
+          finally {
+            Pop-Location
+          }
+
+          $sevenZip = (Get-Command '7z.exe' -ErrorAction SilentlyContinue).Source
+          if (-not $sevenZip) {
+            throw '7z.exe was not found on the runner.'
+          }
+
+          Push-Location $stageRoot
+          try {
+            $sevenZipArgs = @(
+              'a',
+              '-t7z',
+              '-mx=9',
+              '-mtc=off',
+              $portablePath,
+              '.\64\*',
+              '.\ARM64\*'
+            )
+            & $sevenZip @sevenZipArgs
+            if ($LASTEXITCODE -ne 0) {
+              throw "7-Zip failed with exit code $LASTEXITCODE"
+            }
+          }
+          finally {
+            Pop-Location
+          }
+
+          if (-not (Test-Path $installerPath)) {
+            throw 'The installer was not produced.'
+          }
+          if (-not (Test-Path $portablePath)) {
+            throw 'The portable archive was not produced.'
+          }
+
+          $checksumPath = Join-Path $releaseRoot 'SHA256SUMS.txt'
+          $checksumLines = Get-ChildItem -Path $releaseRoot -File |
+            Sort-Object Name |
+            ForEach-Object {
+              $hash = (Get-FileHash -Path $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+              "$hash *$($_.Name)"
+            }
+          [IO.File]::WriteAllLines($checksumPath, $checksumLines, [Text.UTF8Encoding]::new($false))
+
+          Get-ChildItem -Path $releaseRoot | Format-Table Name, Length
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: memreduct-${{ steps.metadata.outputs.version }}-${{ needs.sync.outputs.short_sha }}
+          path: release-output/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish unofficial snapshot release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $repository = '${{ github.repository }}'
+          $tag = '${{ steps.metadata.outputs.tag }}'
+          $version = '${{ steps.metadata.outputs.version }}'
+          $shortSha = '${{ needs.sync.outputs.short_sha }}'
+          $sourceSha = '${{ needs.sync.outputs.source_sha }}'
+          $releaseRoot = Join-Path $env:GITHUB_WORKSPACE 'release-output'
+          $notesPath = Join-Path $env:RUNNER_TEMP 'release-notes.md'
+
+          @"
+          Unofficial automated snapshot of Mem Reduct $version.
+
+          - Upstream: https://github.com/${{ env.UPSTREAM_REPOSITORY }}
+          - Upstream commit: $sourceSha
+          - Architectures: x64 and ARM64
+          - Packages: NSIS installer and portable 7-Zip archive
+
+          These binaries are built by GitHub Actions from the upstream source.
+          They are not an official Henry++ release and are not code-signed or GPG-signed.
+          Windows SmartScreen may therefore show an unknown-publisher warning.
+          "@ | Set-Content -Path $notesPath -Encoding utf8
+
+          $assets = Get-ChildItem -Path $releaseRoot -File |
+            ForEach-Object FullName
+
+          gh release view $tag --repo $repository *> $null
+          if ($LASTEXITCODE -eq 0) {
+            $editArgs = @(
+              'release', 'edit', $tag,
+              '--repo', $repository,
+              '--title', "Mem Reduct $version snapshot ($shortSha)",
+              '--notes-file', $notesPath,
+              '--prerelease'
+            )
+            gh @editArgs
+            if ($LASTEXITCODE -ne 0) {
+              throw "Updating release metadata failed with exit code $LASTEXITCODE"
+            }
+
+            gh release upload $tag @assets --repo $repository --clobber
+          }
+          else {
+            $createArgs = @(
+              'release', 'create', $tag,
+              '--repo', $repository,
+              '--target', $sourceSha,
+              '--title', "Mem Reduct $version snapshot ($shortSha)",
+              '--notes-file', $notesPath,
+              '--prerelease'
+            )
+            gh @createArgs @assets
+          }
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Publishing the release failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Build summary
+        shell: pwsh
+        run: |
+          @"
+          ## Mem Reduct snapshot
+
+          - Upstream commit: `${{ needs.sync.outputs.source_sha }}`
+          - Version: `${{ steps.metadata.outputs.version }}`
+          - Release tag: `${{ steps.metadata.outputs.tag }}`
+          - Architectures: x64 and ARM64
+          - Installer: NSIS (unsigned)
+          "@ >> $env:GITHUB_STEP_SUMMARY
+
+  unchanged:
+    name: No upstream changes
+    needs: sync
+    if: >-
+      needs.sync.outputs.changed != 'true' &&
+      github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Report current upstream revision
+        run: >-
+          echo "No upstream changes; current commit is
+          ${{ needs.sync.outputs.source_sha }}."
