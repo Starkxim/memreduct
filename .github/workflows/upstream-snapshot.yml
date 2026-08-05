@@ -515,8 +515,8 @@ jobs:
               '-mx=9',
               '-mtc=off',
               $portablePath,
-              '.\64\*',
-              '.\ARM64\*'
+              '.\64',
+              '.\ARM64'
             )
             & $sevenZip @sevenZipArgs
             if ($LASTEXITCODE -ne 0) {
